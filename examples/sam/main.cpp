@@ -835,7 +835,6 @@ bool sam_encode(
                 ggml_repeat(ctx0, ggml_reshape_3d(ctx0, model.neck_norm_1_b, 1, 1, n_enc_out_chans), cur));
     }
 
-
     ggml_set_name(cur, "check");
 
     ggml_set_scratch(ctx0, { 0, 0, nullptr, });

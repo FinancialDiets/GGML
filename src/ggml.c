@@ -12583,8 +12583,9 @@ static void ggml_compute_forward_conv_2d_s1_ph_f16_f32(
                 dst_data[i1*ne10 + i0] = 0.0f;
                 for (int k1 = -nh1; k1 <= nh1; k1++) {
                     for (int k0 = -nh0; k0 <= nh0; k0++) {
-                        const int64_t iik0 =      (nh1 + k1)*ne00 +      (nh0 + k0);
-                        const int64_t iik1 = (i1 + nh1 + k1)*ne10 + (i0 + nh0 + k0);
+                        const int64_t iik0 =      (nh1 + k1)*(        ne00) +      (nh0 + k0);
+                        const int64_t iik1 = (i1 + nh1 + k1)*(2*nh0 + ne10) + (i0 + nh0 + k0);
+
                         float v = 0.0f;
                         ggml_vec_dot_f16(ew0, &v,
                                 (ggml_fp16_t *) params->wdata +   i2*ew0*nk + iik0*ew0,
