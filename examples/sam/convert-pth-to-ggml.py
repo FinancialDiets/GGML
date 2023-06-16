@@ -45,6 +45,8 @@ hparams = {
     "n_enc_layers":      12,
     "n_enc_heads":       12,
     "n_enc_out_chans":  256,
+
+    "n_pt_embd": 4,
 }
 
 print(hparams)
@@ -62,6 +64,7 @@ fout.write(struct.pack("i", hparams["n_enc_state"]))
 fout.write(struct.pack("i", hparams["n_enc_layers"]))
 fout.write(struct.pack("i", hparams["n_enc_heads"]))
 fout.write(struct.pack("i", hparams["n_enc_out_chans"]))
+fout.write(struct.pack("i", hparams["n_pt_embd"]))
 fout.write(struct.pack("i", ftype))
 
 for k, v in model.items():
@@ -69,7 +72,12 @@ for k, v in model.items():
     shape = v.shape
 
     # TODO: export only the Encoder -- after it works we will export the other stuff
-    if name[:13] != "image_encoder":
+    if name[:13] != "image_encoder" and \
+       name[:14] != "prompt_encoder":
+        continue
+
+    if name[:19] == "prompt_encoder.mask" or \
+       name[:22] == "prompt_encoder.no_mask":
         continue
 
     print("Processing variable: " + name + " with shape: ", shape, " and type: ", v.dtype)
@@ -96,7 +104,8 @@ for k, v in model.items():
     # default type is fp16
     ftype_cur = 1
     if ftype == 0 or n_dims == 1 or \
-            name == "image_encoder.pos_embed":
+            name == "image_encoder.pos_embed" or \
+            name.startswith("prompt_encoder.point_embeddings"):
         print("  Converting to float32")
         data = data.astype(np.float32)
         ftype_cur = 0

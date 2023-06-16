@@ -20,6 +20,7 @@ struct sam_hparams {
     int32_t n_enc_layer       = 12;
     int32_t n_enc_head        = 12;
     int32_t n_enc_out_chans   = 256;
+    int32_t n_pt_embd         = 4;
     int32_t ftype             = 1;
 
     int32_t n_enc_head_dim() const { return n_enc_state / n_enc_head; }
@@ -78,17 +79,7 @@ struct sam_layer_enc {
     struct ggml_tensor * mlp_lin2_b;
 };
 
-struct sam_layer_enc_prompt {
-    // TODO
-};
-
-struct sam_layer_dec {
-    // TODO
-};
-
-struct sam_model {
-    sam_hparams hparams;
-
+struct sam_encoder_image {
     struct ggml_tensor * pe;
 
     struct ggml_tensor * proj_w;
@@ -101,15 +92,42 @@ struct sam_model {
     struct ggml_tensor * neck_norm_1_w;
     struct ggml_tensor * neck_norm_1_b;
 
-    std::vector<sam_layer_enc>        layers_enc;
-    std::vector<sam_layer_enc_prompt> layers_enc_prompt;
-    std::vector<sam_layer_dec>        layers_dec;
+    std::vector<sam_layer_enc> layers;
+};
+
+struct sam_encoder_prompt {
+    struct ggml_tensor * pe;
+
+    struct ggml_tensor * not_a_pt_embd_w;
+    std::vector<struct ggml_tensor *> pt_embd;
+
+    //struct ggml_tensor * no_mask_embd_w;
+    //std::vector<struct ggml_tensor *> mask_down_w;
+    //std::vector<struct ggml_tensor *> mask_down_b;
+};
+
+struct sam_layer_dec {
+    // TODO
+};
+
+struct sam_model {
+    sam_hparams hparams;
+
+    sam_encoder_image  enc_img;
+    sam_encoder_prompt enc_prompt;
+
+    std::vector<sam_layer_dec> layers_dec;
 
     // TODO KV cache
 
     //
     struct ggml_context * ctx;
     std::map<std::string, struct ggml_tensor *> tensors;
+};
+
+struct sam_point {
+    float x;
+    float y;
 };
 
 // RGB uint8 image
@@ -128,6 +146,18 @@ struct sam_image_f32 {
 
     std::vector<float> data;
 };
+
+void ggml_sam_sin(const int n, float * dst, const float * src) {
+    for (int i = 0; i < n; ++i) {
+        dst[i] = sinf(src[i]);
+    }
+}
+
+void ggml_sam_cos(const int n, float * dst, const float * src) {
+    for (int i = 0; i < n; ++i) {
+        dst[i] = cosf(src[i]);
+    }
+}
 
 bool sam_image_load_from_file(const std::string & fname, sam_image_u8 & img) {
     int nx, ny, nc;
@@ -247,6 +277,7 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
         fin.read((char *) &hparams.n_enc_layer,     sizeof(hparams.n_enc_layer));
         fin.read((char *) &hparams.n_enc_head,      sizeof(hparams.n_enc_head));
         fin.read((char *) &hparams.n_enc_out_chans, sizeof(hparams.n_enc_out_chans));
+        fin.read((char *) &hparams.n_pt_embd,       sizeof(hparams.n_pt_embd));
         fin.read((char *) &hparams.ftype,           sizeof(hparams.ftype));
 
         const int32_t qntvr = hparams.ftype / GGML_QNT_VERSION_FACTOR;
@@ -255,6 +286,7 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
         printf("%s: n_enc_layer      = %d\n", __func__, hparams.n_enc_layer);
         printf("%s: n_enc_head       = %d\n", __func__, hparams.n_enc_head);
         printf("%s: n_enc_out_chans  = %d\n", __func__, hparams.n_enc_out_chans);
+        printf("%s: n_pt_embd        = %d\n", __func__, hparams.n_pt_embd);
         printf("%s: ftype            = %d\n", __func__, hparams.ftype);
         printf("%s: qntvr            = %d\n", __func__, qntvr);
 
@@ -281,6 +313,7 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
         const int32_t n_enc_layer     = hparams.n_enc_layer;
         const int32_t n_enc_head_dim  = hparams.n_enc_head_dim();
         const int32_t n_enc_out_chans = hparams.n_enc_out_chans;
+        const int32_t n_pt_embd       = hparams.n_pt_embd;
 
         const int32_t n_enc_layer_local  = hparams.global_attn_indices().size();
         const int32_t n_enc_layer_global = n_enc_layer - n_enc_layer_local;
@@ -289,7 +322,7 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
         const int32_t n_window_size = hparams.n_window_size();
         const int32_t n_patch_size  = hparams.n_patch_size();
 
-        // encoder
+        // image encoder
         {
             ctx_size += n_enc_state*n_img_embd*n_img_embd*ggml_type_sizef(GGML_TYPE_F32);
 
@@ -306,7 +339,7 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
             ctx_size += n_enc_out_chans*ggml_type_sizef(GGML_TYPE_F32);
         }
 
-        // encoder layers
+        // image encoder layers
         {
             ctx_size += n_enc_layer*n_enc_state*ggml_type_sizef(GGML_TYPE_F32);
             ctx_size += n_enc_layer*n_enc_state*ggml_type_sizef(GGML_TYPE_F32);
@@ -334,6 +367,16 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
         }
 
         ctx_size += (8 + 14*n_enc_layer)*ggml_tensor_overhead();
+
+        // prompt encoder
+        {
+            ctx_size += n_enc_out_chans*ggml_type_sizef(GGML_TYPE_F16); // 2*(n_enc_out_chans/2)
+
+            ctx_size += n_enc_out_chans*ggml_type_sizef(GGML_TYPE_F32);
+            ctx_size += n_pt_embd*n_enc_out_chans*ggml_type_sizef(GGML_TYPE_F32);
+        }
+
+        ctx_size += (2 + n_pt_embd)*ggml_tensor_overhead();
 
         fprintf(stderr, "%s: ggml ctx size = %6.2f MB\n", __func__, ctx_size/(1024.0*1024.0));
 
@@ -363,45 +406,48 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
         const int32_t n_enc_layer      = hparams.n_enc_layer;
         const int32_t n_enc_head_dim   = hparams.n_enc_head_dim();
         const int32_t n_enc_out_chans  = hparams.n_enc_out_chans;
+        const int32_t n_pt_embd        = hparams.n_pt_embd;
 
         const int32_t n_img_embd    = hparams.n_img_embd();
         const int32_t n_window_size = hparams.n_window_size();
         const int32_t n_patch_size  = hparams.n_patch_size();
 
-        model.layers_enc.resize(n_enc_layer);
+        model.enc_img.layers.resize(n_enc_layer);
 
-        // encoder
+        // image encoder
         {
-            model.pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_enc_state, n_img_embd, n_img_embd, 1);
+            auto & enc = model.enc_img;
 
-            model.proj_w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_patch_size, n_patch_size,           3, n_enc_state);
-            model.proj_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,            1,            1, n_enc_state);
+            enc.pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_enc_state, n_img_embd, n_img_embd, 1);
 
-            model.neck_conv_0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, 1, n_enc_state,     n_enc_out_chans);
-            model.neck_conv_1 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, n_enc_out_chans, n_enc_out_chans);
+            enc.proj_w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_patch_size, n_patch_size,           3, n_enc_state);
+            enc.proj_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,            1,            1, n_enc_state);
 
-            model.neck_norm_0_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_out_chans);
-            model.neck_norm_0_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_out_chans);
+            enc.neck_conv_0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, 1, n_enc_state,     n_enc_out_chans);
+            enc.neck_conv_1 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, n_enc_out_chans, n_enc_out_chans);
 
-            model.neck_norm_1_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_out_chans);
-            model.neck_norm_1_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_out_chans);
+            enc.neck_norm_0_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_out_chans);
+            enc.neck_norm_0_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_out_chans);
 
-            model.tensors["image_encoder.pos_embed"] = model.pe;
+            enc.neck_norm_1_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_out_chans);
+            enc.neck_norm_1_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_out_chans);
 
-            model.tensors["image_encoder.patch_embed.proj.weight"] = model.proj_w;
-            model.tensors["image_encoder.patch_embed.proj.bias"]   = model.proj_b;
+            model.tensors["image_encoder.pos_embed"] = enc.pe;
 
-            model.tensors["image_encoder.neck.0.weight"] = model.neck_conv_0;
-            model.tensors["image_encoder.neck.2.weight"] = model.neck_conv_1;
+            model.tensors["image_encoder.patch_embed.proj.weight"] = enc.proj_w;
+            model.tensors["image_encoder.patch_embed.proj.bias"]   = enc.proj_b;
 
-            model.tensors["image_encoder.neck.1.weight"] = model.neck_norm_0_w;
-            model.tensors["image_encoder.neck.1.bias"]   = model.neck_norm_0_b;
+            model.tensors["image_encoder.neck.0.weight"] = enc.neck_conv_0;
+            model.tensors["image_encoder.neck.2.weight"] = enc.neck_conv_1;
 
-            model.tensors["image_encoder.neck.3.weight"] = model.neck_norm_1_w;
-            model.tensors["image_encoder.neck.3.bias"]   = model.neck_norm_1_b;
+            model.tensors["image_encoder.neck.1.weight"] = enc.neck_norm_0_w;
+            model.tensors["image_encoder.neck.1.bias"]   = enc.neck_norm_0_b;
+
+            model.tensors["image_encoder.neck.3.weight"] = enc.neck_norm_1_w;
+            model.tensors["image_encoder.neck.3.bias"]   = enc.neck_norm_1_b;
 
             for (int i = 0; i < n_enc_layer; ++i) {
-                auto & layer = model.layers_enc[i];
+                auto & layer = enc.layers[i];
 
                 layer.norm1_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_state);
                 layer.norm1_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_state);
@@ -452,7 +498,26 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
             }
         }
 
-        // TODO: decoder / prompt encoder
+        // prompt encoder
+        {
+            auto & enc = model.enc_prompt;
+
+            enc.pe = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_enc_out_chans/2, 2);
+
+            enc.not_a_pt_embd_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, n_enc_out_chans);
+
+            model.tensors["prompt_encoder.pe_layer.positional_encoding_gaussian_matrix"] = enc.pe;
+            model.tensors["prompt_encoder.not_a_point_embed.weight"] = enc.not_a_pt_embd_w;
+
+            enc.pt_embd.resize(n_pt_embd);
+            for (int i = 0; i < n_pt_embd; i++) {
+                enc.pt_embd[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_out_chans);
+
+                model.tensors["prompt_encoder.point_embeddings." + std::to_string(i) + ".weight"] = enc.pt_embd[i];
+            }
+        }
+
+        // TODO: decoder
     }
 
     // key + value memory
@@ -555,12 +620,13 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
     return true;
 }
 
-bool sam_encode(
-        const sam_model & model,
+bool sam_encode_image(
+            const sam_model & model,
         const sam_image_f32 & img,
-        int n_threads) {
+                        int   n_threads) {
 
     const auto & hparams = model.hparams;
+    const auto & enc = model.enc_img;
 
     const int32_t n_enc_state     = hparams.n_enc_state;
     const int32_t n_enc_layer     = hparams.n_enc_layer;
@@ -569,9 +635,7 @@ bool sam_encode(
     const int32_t n_enc_out_chans = hparams.n_enc_out_chans;
 
     const int32_t n_img_size    = hparams.n_img_size();
-    const int32_t n_img_embd    = hparams.n_img_embd();
     const int32_t n_window_size = hparams.n_window_size();
-    const int32_t n_patch_size  = hparams.n_patch_size();
 
     static size_t buf_size = 256u*1024*1024;
     static void * buf = malloc(buf_size);
@@ -614,10 +678,10 @@ bool sam_encode(
     }
 
     // ref: https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/modeling/image_encoder.py#L392
-    struct ggml_tensor * cur = ggml_conv_2d_sk_p0(ctx0, model.proj_w, inp);
+    struct ggml_tensor * cur = ggml_conv_2d_sk_p0(ctx0, enc.proj_w, inp);
     cur = ggml_add(ctx0,
             ggml_repeat(ctx0,
-                model.proj_b,
+                enc.proj_b,
                 cur),
             cur);
 
@@ -632,12 +696,12 @@ bool sam_encode(
     //        ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, n_enc_state, n_img_embd, n_img_embd));
 
     // ref: https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/modeling/image_encoder.py#L108-L109
-    cur = ggml_add(ctx0, model.pe, cur);
+    cur = ggml_add(ctx0, enc.pe, cur);
 
     struct ggml_tensor * inpL = cur;
 
     for (int il = 0; il < n_enc_layer; ++il) {
-        const auto & layer = model.layers_enc[il];
+        const auto & layer = enc.layers[il];
 
         ggml_set_scratch(ctx0, { 0, scr0_size, scr0, });
 
@@ -801,7 +865,7 @@ bool sam_encode(
 
     cur = ggml_cont(ctx0, ggml_permute(ctx0, inpL, 2, 0, 1, 3));
 
-    cur = ggml_conv_2d_sk_p0(ctx0, model.neck_conv_0, cur);
+    cur = ggml_conv_2d_sk_p0(ctx0, enc.neck_conv_0, cur);
 
     // LayerNorm2d
     {
@@ -813,12 +877,12 @@ bool sam_encode(
 
         cur = ggml_add(ctx0,
                 ggml_mul(ctx0,
-                    ggml_repeat(ctx0, ggml_reshape_3d(ctx0, model.neck_norm_0_w, 1, 1, n_enc_out_chans), cur),
+                    ggml_repeat(ctx0, ggml_reshape_3d(ctx0, enc.neck_norm_0_w, 1, 1, n_enc_out_chans), cur),
                     cur),
-                ggml_repeat(ctx0, ggml_reshape_3d(ctx0, model.neck_norm_0_b, 1, 1, n_enc_out_chans), cur));
+                ggml_repeat(ctx0, ggml_reshape_3d(ctx0, enc.neck_norm_0_b, 1, 1, n_enc_out_chans), cur));
     }
 
-    cur = ggml_conv_2d_s1_ph(ctx0, model.neck_conv_1, cur);
+    cur = ggml_conv_2d_s1_ph(ctx0, enc.neck_conv_1, cur);
 
     // LayerNorm2d
     {
@@ -830,9 +894,9 @@ bool sam_encode(
 
         cur = ggml_add(ctx0,
                 ggml_mul(ctx0,
-                    ggml_repeat(ctx0, ggml_reshape_3d(ctx0, model.neck_norm_1_w, 1, 1, n_enc_out_chans), cur),
+                    ggml_repeat(ctx0, ggml_reshape_3d(ctx0, enc.neck_norm_1_w, 1, 1, n_enc_out_chans), cur),
                     cur),
-                ggml_repeat(ctx0, ggml_reshape_3d(ctx0, model.neck_norm_1_b, 1, 1, n_enc_out_chans), cur));
+                ggml_repeat(ctx0, ggml_reshape_3d(ctx0, enc.neck_norm_1_b, 1, 1, n_enc_out_chans), cur));
     }
 
     ggml_set_name(cur, "check");
@@ -863,6 +927,184 @@ bool sam_encode(
             for (int y = 0; y < 64; ++y) {
                 for (int x = 0; x < 64; ++x) {
                     printf("%5.2f ", data[(y*64 + x)*64 + 41]);
+                }
+                printf("\n");
+            }
+            printf("\n");
+            //for (int y = 0; y < 64; ++y) {
+            //    for (int x = 0; x < 64; ++x) {
+            //        printf("%5.2f ", data[(y*64 + x)*768 + 231]);
+            //    }
+            //    printf("\n");
+            //}
+            //printf("\n");
+            double sum = 0.0;
+            for (int i = 0; i < ggml_nelements(t); i++) {
+                sum += data[i];
+            }
+            printf("sum:  %f\n", sum);
+            exit(0);
+        };
+
+        auto print_t_f16 = [&](struct ggml_tensor * t) {
+            ggml_fp16_t * data = (ggml_fp16_t *)t->data;
+            printf("dims: %jd %jd %jd %jd f16\n", t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+            printf("data: ");
+            for (int i = 0; i < std::min((int) t->ne[0], 10); i++) {
+                printf("%f ", ggml_fp16_to_fp32(data[i]));
+            }
+            printf("\n");
+            for (int y = 0; y < 14; ++y) {
+                for (int x = 0; x < 14; ++x) {
+                    printf("%7.4f ", ggml_fp16_to_fp32(data[(y*14 + x)*64 + 23]));
+                }
+                printf("\n");
+            }
+            printf("\n");
+            double sum = 0.0;
+            for (int i = 0; i < ggml_nelements(t); i++) {
+                sum += ggml_fp16_to_fp32(data[i]);
+            }
+            printf("sum:  %f\n", sum);
+            exit(0);
+        };
+
+        auto * t = ggml_get_tensor(ctx0, "check");
+        if (t->type == GGML_TYPE_F32) {
+            print_t_f32(t);
+        } else {
+            print_t_f16(t);
+        }
+    }
+
+    //printf("used_mem = %zu\n", ggml_used_mem(ctx0));
+
+    ggml_free(ctx0);
+    return true;
+}
+
+// encode a prompt
+//
+// - points
+// - boxes
+// - masks
+//
+// TODO: currently just encode a single point for simplicity
+//
+bool sam_encode_prompt(
+        const sam_model     & model,
+                        int   nx,
+                        int   ny,
+                  sam_point   point,
+                        int   n_threads) {
+
+    const auto & hparams = model.hparams;
+    const auto & enc = model.enc_prompt;
+
+    //const int32_t n_enc_state     = hparams.n_enc_state;
+    //const int32_t n_enc_layer     = hparams.n_enc_layer;
+    //const int32_t n_enc_head      = hparams.n_enc_head;
+    //const int32_t n_enc_head_dim  = hparams.n_enc_head_dim();
+    //const int32_t n_enc_out_chans = hparams.n_enc_out_chans;
+
+    //const int32_t n_img_size    = hparams.n_img_size();
+    //const int32_t n_window_size = hparams.n_window_size();
+
+    static size_t buf_size = 256u*1024*1024;
+    static void * buf = malloc(buf_size);
+
+    struct ggml_init_params params = {
+        .mem_size   = buf_size,
+        .mem_buffer = buf,
+        .no_alloc   = false,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+    struct ggml_cgraph gf = {};
+    gf.n_threads = n_threads;
+
+    // transform points
+    // ref: https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/automatic_mask_generator.py#L276
+    {
+        const int nmax = std::max(nx, ny);
+
+        const float scale = hparams.n_img_size() / (float) nmax;
+
+        const int nx_new = int(nx*scale + 0.5f);
+        const int ny_new = int(ny*scale + 0.5f);
+
+        point.x = point.x*(float(nx_new)/nx) + 0.5f;
+        point.y = point.y*(float(ny_new)/ny) + 0.5f;
+    }
+
+    printf("point: %f %f\n", point.x, point.y);
+
+    struct ggml_tensor * inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 2, 2);
+
+    // set the input by converting the [0, 1] coordinates to [-1, 1]
+    {
+        float * data = (float *) inp->data;
+
+        data[0] = 2.0f*(point.x / hparams.n_img_size()) - 1.0f;
+        data[1] = 2.0f*(point.y / hparams.n_img_size()) - 1.0f;
+
+        // padding
+        // ref: https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/modeling/prompt_encoder.py#L81-L85
+        data[2] = 2.0f*(0.0f) - 1.0f;
+        data[3] = 2.0f*(0.0f) - 1.0f;
+    }
+
+    struct ggml_tensor * cur = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, enc.pe)), inp);
+
+    cur = ggml_scale(ctx0, cur, ggml_new_f32(ctx0, 2.0f*M_PI));
+
+    // concat
+    // ref: https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/modeling/prompt_encoder.py#L192
+    {
+        struct ggml_tensor * t_sin = ggml_map_unary_f32(ctx0, cur, ggml_sam_sin);
+        struct ggml_tensor * t_cos = ggml_map_unary_f32(ctx0, cur, ggml_sam_cos);
+
+        cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, t_sin->ne[0] + t_cos->ne[0], cur->ne[1]);
+
+        ggml_build_forward_expand(&gf, ggml_cpy(ctx0, t_sin, ggml_view_2d(ctx0, cur, t_sin->ne[0], t_sin->ne[1], cur->nb[1], 0)));
+        ggml_build_forward_expand(&gf, ggml_cpy(ctx0, t_cos, ggml_view_2d(ctx0, cur, t_sin->ne[0], t_sin->ne[1], cur->nb[1], t_sin->nb[1])));
+
+        // overwrite label == -1 with not_a_point_embed.weight
+        // ref: https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/modeling/prompt_encoder.py#L86
+        // TODO: extend for multiple points
+        ggml_build_forward_expand(&gf, ggml_cpy(ctx0, enc.not_a_pt_embd_w, ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], cur->nb[1])));
+
+        // add point_embeddings[1] to label == 1
+        // ref: https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/modeling/prompt_encoder.py#L90
+        ggml_build_forward_expand(&gf, ggml_add_inplace(ctx0, ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], 0), enc.pt_embd[1]));
+    }
+
+    ggml_set_name(cur, "check");
+
+    // run the computation
+    ggml_build_forward_expand(&gf, cur);
+    ggml_graph_compute       (ctx0, &gf);
+
+    // print
+    {
+        auto print_t_f32 = [&](struct ggml_tensor * t) {
+            float * data = (float *)t->data;
+            printf("dims: %jd %jd %jd %jd f32\n", t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+            printf("data: ");
+            for (int i = 0; i < std::min((int) t->ne[0], 10); i++) {
+                printf("%f ", data[i]);
+            }
+            printf("\n");
+            //for (int y = 0; y < 64; ++y) {
+            //    for (int x = 0; x < 64; ++x) {
+            //        printf("%5.2f ", data[y*64 + x]);
+            //    }
+            //    printf("\n");
+            //}
+            //printf("\n");
+            for (int y = 0; y < 2; ++y) {
+                for (int x = 0; x < 256; ++x) {
+                    printf("%5.2f ", data[y*256 + x]);
                 }
                 printf("\n");
             }
@@ -980,8 +1222,16 @@ int main(int argc, char ** argv) {
         t_load_us = ggml_time_us() - t_start_us;
     }
 
-    if (!sam_encode(model, img1, params.n_threads)) {
-        fprintf(stderr, "%s: failed to encode image\n", __func__);
+    //if (!sam_encode_image(model, img1, params.n_threads)) {
+    //    fprintf(stderr, "%s: failed to encode image\n", __func__);
+    //    return 1;
+    //}
+
+    // TODO: user input
+    const sam_point pt = { 414.375f, 162.796875f, };
+
+    if (!sam_encode_prompt(model, img0.nx, img0.ny, pt, params.n_threads)) {
+        fprintf(stderr, "%s: failed to encode prompt\n", __func__);
         return 1;
     }
 
